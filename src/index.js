@@ -6,7 +6,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ROOT = path.join(__dirname, '..');
+const ROOT = process.cwd();
 const MASTER_FILE = path.join(ROOT, 'data', 'master.json');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 let runtimeEnv = null;
