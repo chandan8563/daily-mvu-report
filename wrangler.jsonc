@@ -12,7 +12,7 @@
 	},
 	"d1_databases": [
 		{
-			"binding": "daily_mvu_report_db",
+			"binding": "db",
 			"database_name": "daily-mvu-report-db",
 			"database_id": "821f6e5a-ba09-4805-80ac-87872aeff87a",
 			"remote": true
