@@ -9,9 +9,12 @@ const PORT = process.env.PORT || 3000;
 const ROOT = path.join(__dirname, '..');
 const MASTER_FILE = path.join(ROOT, 'data', 'master.json');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+let runtimeEnv = null;
+let workerMasterCache = [];
+function setRuntimeEnv(env) { runtimeEnv = env || null; }
 
 app.use(express.json({ limit: '5mb' }));
-app.use(express.static(path.join(ROOT, 'public')));
+if (globalThis.CLOUDFLARE_WORKER !== true) app.use(express.static(path.join(ROOT, 'public')));
 
 const aliases = {
   created: ['CreatedDateTime', 'Created DateTime', 'Created Date', 'Date'],
@@ -66,7 +69,12 @@ function isDeath(row) { const s=subStatusNorm(row); return s==='animal death' ||
 function isLocalVet(row) { return subStatusNorm(row) === 'treated by local vet'; }
 function isAttend(row) { return subStatusNorm(row) === 'visited farmer'; }
 
-function loadMaster() {
+async function loadMaster() {
+  if (runtimeEnv?.DB) {
+    const { results } = await runtimeEnv.DB.prepare('SELECT division, district, block, vehicle_number AS vehicleNumber, paravet_id AS paravetId, week_off AS weekOff FROM master_data ORDER BY rowid').all();
+    return results || [];
+  }
+  if (globalThis.CLOUDFLARE_WORKER === true) return workerMasterCache.slice();
   try {
     const parsed = JSON.parse(fs.readFileSync(MASTER_FILE, 'utf8'));
     if (Array.isArray(parsed)) return parsed;
@@ -74,10 +82,23 @@ function loadMaster() {
     return [];
   } catch { return []; }
 }
-function saveMaster(rows) { fs.writeFileSync(MASTER_FILE, JSON.stringify(rows, null, 2)); }
-function masterIndex() {
+async function saveMaster(rows) {
+  if (runtimeEnv?.DB) {
+    const db = runtimeEnv.DB;
+    await db.exec('DELETE FROM master_data');
+    if (rows.length) {
+      const stmt = db.prepare('INSERT INTO master_data (division,district,block,vehicle_number,paravet_id,week_off) VALUES (?,?,?,?,?,?)');
+      const batch = rows.map(r => stmt.bind(r.division||'', r.district||'', r.block||'', r.vehicleNumber||'', r.paravetId||'', r.weekOff||''));
+      await db.batch(batch);
+    }
+    return;
+  }
+  if (globalThis.CLOUDFLARE_WORKER === true) { workerMasterCache = Array.isArray(rows) ? rows.slice() : []; return; }
+  fs.writeFileSync(MASTER_FILE, JSON.stringify(rows, null, 2));
+}
+async function masterIndex() {
   const map = new Map();
-  const rows = loadMaster();
+  const rows = await loadMaster();
   for (const r of rows) {
     if (!r || typeof r !== 'object') continue;
     const pid = r.paravetId ?? r['Paravet ID'] ?? r.ParavetID ?? '';
@@ -97,7 +118,7 @@ function rowsFromWorkbook(buf) {
   return rows.filter(r => r && typeof r === 'object' && !Array.isArray(r));
 }
 
-function processDetailed(rows) {
+async function processDetailed(rows) {
   if (!Array.isArray(rows) || !rows.length) throw new Error('No data rows found in the Detailed Report.');
 
   const parsed = rows.map((r, i) => ({
@@ -113,7 +134,7 @@ function processDetailed(rows) {
   const dates = [...new Map(parsed.map(x => [dateKey(x.date), x.date])).values()].sort((a,b) => a-b);
   if (dates.length > 5) throw new Error('Maximum 5 dates are allowed.');
 
-  const master = masterIndex();
+  const master = await masterIndex();
   if (!(master instanceof Map)) throw new Error('Master Server Data is invalid. Please upload the Master Server Data again.');
   const missing = [];
   const hospital = [];
@@ -361,8 +382,8 @@ app.get('/api/master/sample', (_,res)=>{
   res.setHeader('Content-Disposition','attachment; filename=Master-Server-Data-Sample.xlsx');
   res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').send(buf);
 });
-app.get('/api/master', (_,res)=>res.json(loadMaster()));
-app.post('/api/master', (req,res)=>{
+app.get('/api/master', async (_,res)=>{ try { res.json(await loadMaster()); } catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/master', async (req,res)=>{
   const rows = Array.isArray(req.body) ? req.body : req.body.rows;
   if (!Array.isArray(rows)) return res.status(400).json({error:'Master data must be an array.'});
   const unique = new Map();
@@ -371,13 +392,13 @@ app.post('/api/master', (req,res)=>{
     if (item.paravetId) unique.set(norm(item.paravetId), item);
   }
   const cleaned = Array.from(unique.values());
-  saveMaster(cleaned); res.json({ok:true,count:cleaned.length});
+  await saveMaster(cleaned); res.json({ok:true,count:cleaned.length});
 });
-app.post('/api/master/bulk-upload', upload.array('files', 20), (req,res)=>{
+app.post('/api/master/bulk-upload', upload.array('files', 20), async (req,res)=>{
   try {
     const files = Array.isArray(req.files) ? req.files : [];
     if (!files.length) return res.status(400).json({error:'Please select at least one Master Data file.'});
-    const map = new Map(loadMaster().filter(r=>r && r.paravetId).map(r=>[norm(r.paravetId), r]));
+    const map = new Map((await loadMaster()).filter(r=>r && r.paravetId).map(r=>[norm(r.paravetId), r]));
     let added=0, updated=0;
     for (const file of files) {
       const rows = rowsFromWorkbook(file.buffer);
@@ -387,32 +408,32 @@ app.post('/api/master/bulk-upload', upload.array('files', 20), (req,res)=>{
         const k=norm(item.paravetId); if(map.has(k)) updated++; else added++; map.set(k,item);
       }
     }
-    const cleaned=Array.from(map.values()); saveMaster(cleaned);
+    const cleaned=Array.from(map.values()); await saveMaster(cleaned);
     res.json({ok:true,count:cleaned.length,added,updated});
   } catch(e){res.status(400).json({error:e.message});}
 });
-app.put('/api/master/:paravetId', (req,res)=>{
+app.put('/api/master/:paravetId', async (req,res)=>{
   try {
-    const id=norm(req.params.paravetId); const rows=loadMaster(); const idx=rows.findIndex(r=>norm(r?.paravetId)===id);
+    const id=norm(req.params.paravetId); const rows=await loadMaster(); const idx=rows.findIndex(r=>norm(r?.paravetId)===id);
     if(idx<0) return res.status(404).json({error:'Paravet ID not found.'});
     const b=req.body||{}; const current=rows[idx];
     rows[idx]={...current,division:String(b.division??current.division??'').trim(),district:String(b.district??current.district??'').trim(),block:String(b.block??current.block??'').trim(),vehicleNumber:String(b.vehicleNumber??current.vehicleNumber??'').trim(),paravetId:String(b.paravetId??current.paravetId??'').trim(),weekOff:String(b.weekOff??current.weekOff??'').trim()};
     if(!rows[idx].paravetId) return res.status(400).json({error:'Paravet ID is required.'});
     const duplicate = rows.findIndex((r,i)=>i!==idx && norm(r?.paravetId)===norm(rows[idx].paravetId));
     if(duplicate>=0) return res.status(400).json({error:'Duplicate Paravet ID. ParavetID must be unique.'});
-    saveMaster(rows); res.json({ok:true,row:rows[idx]});
+    await saveMaster(rows); res.json({ok:true,row:rows[idx]});
   } catch(e){res.status(400).json({error:e.message});}
 });
-app.post('/api/master/delete', (req,res)=>{
-  try { const ids=Array.isArray(req.body?.ids)?req.body.ids.map(norm).filter(Boolean):[]; if(!ids.length)return res.status(400).json({error:'No Master Data rows selected.'}); const set=new Set(ids); const rows=loadMaster(); const kept=rows.filter(r=>!set.has(norm(r?.paravetId))); const deleted=rows.length-kept.length; saveMaster(kept); res.json({ok:true,deleted,count:kept.length}); }
+app.post('/api/master/delete', async (req,res)=>{
+  try { const ids=Array.isArray(req.body?.ids)?req.body.ids.map(norm).filter(Boolean):[]; if(!ids.length)return res.status(400).json({error:'No Master Data rows selected.'}); const set=new Set(ids); const rows=await loadMaster(); const kept=rows.filter(r=>!set.has(norm(r?.paravetId))); const deleted=rows.length-kept.length; await saveMaster(kept); res.json({ok:true,deleted,count:kept.length}); }
   catch(e){res.status(400).json({error:e.message});}
 });
-app.post('/api/master/upload', upload.single('file'), (req,res)=>{
-  try { const rows=rowsFromWorkbook(req.file.buffer); const cleaned=rows.map(r=>({division:pick(r,aliases.division),district:pick(r,aliases.district),block:pick(r,aliases.block),vehicleNumber:pick(r,aliases.vehicle),paravetId:pick(r,['Paravet ID','ParavetID','Pravet ID']),weekOff:pick(r,['Week off','Week Off'])})).filter(r=>r.paravetId); saveMaster(cleaned); res.json({ok:true,count:cleaned.length}); }
+app.post('/api/master/upload', upload.single('file'), async (req,res)=>{
+  try { const rows=rowsFromWorkbook(req.file.buffer); const cleaned=rows.map(r=>({division:pick(r,aliases.division),district:pick(r,aliases.district),block:pick(r,aliases.block),vehicleNumber:pick(r,aliases.vehicle),paravetId:pick(r,['Paravet ID','ParavetID','Pravet ID']),weekOff:pick(r,['Week off','Week Off'])})).filter(r=>r.paravetId); await saveMaster(cleaned); res.json({ok:true,count:cleaned.length}); }
   catch(e){res.status(400).json({error:e.message});}
 });
-app.post('/api/report/upload', upload.single('file'), (req,res)=>{
-  try { const rows=rowsFromWorkbook(req.file.buffer); lastResult=processDetailed(rows); res.json(lastResult); }
+app.post('/api/report/upload', upload.single('file'), async (req,res)=>{
+  try { const rows=rowsFromWorkbook(req.file.buffer); lastResult=await processDetailed(rows); res.json(lastResult); }
   catch(e){res.status(400).json({error:e.message});}
 });
 app.get('/api/report', (_,res)=>{ if(!lastResult) return res.status(404).json({error:'No report uploaded.'}); res.json(lastResult); });
@@ -421,4 +442,8 @@ app.get('/api/hospital/download/:date', (req,res)=>{ try { if(!lastResult) throw
 app.get('/report',(req,res)=>res.sendFile(path.join(ROOT,'public','report.html')));
 app.get('*',(req,res)=>res.sendFile(path.join(ROOT,'public','index.html')));
 
-app.listen(PORT,()=>console.log(`MVU Report Website running at http://localhost:${PORT}`));
+if (globalThis.CLOUDFLARE_WORKER !== true) {
+  app.listen(PORT,()=>console.log(`MVU Report Website running at http://localhost:${PORT}`));
+}
+
+module.exports = { app, setRuntimeEnv };
