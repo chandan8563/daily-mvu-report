@@ -1,11 +1,21 @@
 {
-  "name": "daily-mvu-report",
-  "main": "src/worker.js",
-  "compatibility_date": "2026-09-02",
-  "compatibility_flags": ["nodejs_compat"],
-  "assets": {
-    "directory": "./public",
-    "binding": "ASSETS",
-    "not_found_handling": "single-page-application"
-  },
+	"name": "daily-mvu-report",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-09-02",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application"
+	},
+	"d1_databases": [
+		{
+			"binding": "daily_mvu_report_db",
+			"database_name": "daily-mvu-report-db",
+			"database_id": "821f6e5a-ba09-4805-80ac-87872aeff87a",
+			"remote": true
+		}
+	],
 }
